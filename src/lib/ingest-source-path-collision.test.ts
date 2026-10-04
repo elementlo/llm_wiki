@@ -23,6 +23,7 @@ let truncateGenerationOnce = false
 let emptyGenerationOnce = false
 let confirmResumeCompleteOnce = false
 let truncateAnalysisOnce = false
+let truncateChunkCount = 0
 
 vi.mock("./llm-client", () => ({
   streamChat: vi.fn(async (_cfg, messages, cb) => {
@@ -63,6 +64,12 @@ vi.mock("./llm-client", () => ({
     }
 
     if (systemPrompt.startsWith("You are analyzing a long source document")) {
+      if (truncateChunkCount > 0) {
+        truncateChunkCount--
+        cb.onToken("## Chunk Analysis\nPartial chunk")
+        cb.onDone({ finishReason: "length", truncated: true })
+        return
+      }
       const chunkMatch = userPrompt.match(/Chunk:\s*(\d+)\/(\d+)/)
       const chunkIndex = chunkMatch?.[1] ?? "0"
       const numericChunkIndex = Number(chunkIndex)
@@ -186,6 +193,7 @@ describe("autoIngest source summary paths", () => {
     emptyGenerationOnce = false
     confirmResumeCompleteOnce = false
     truncateAnalysisOnce = false
+    truncateChunkCount = 0
     mockStreamChat.mockClear()
     mockParseWithMineru.mockReset()
     tmp = await createTempProject("same-basename-sources")
@@ -352,6 +360,35 @@ describe("autoIngest source summary paths", () => {
     expect(content).toContain("corrected wording")
     expect(content).not.toContain("obsolete wording")
     expect(mergeRequestCount).toBe(0)
+  })
+
+  it("recovers a 5849-character dense source below the normal chunk minimum", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const sourcePath = `${tmp.path}/raw/sources/project-a/short-dense.md`
+    const body = ("# Short dense guide\n\n## Configuration\n" + "配置和接口边界。\n".repeat(800)).slice(0, 5849)
+    expect(body.length).toBe(5849)
+    await writeFileRaw(sourcePath, body)
+    truncateAnalysisOnce = true
+    truncateChunkCount = 1
+    sourceMarkers = ["short dense recovery"]
+    await autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)
+    const calls = mockStreamChat.mock.calls.filter(c => String(c[1]?.[0]?.content).startsWith("You are analyzing a long source document"))
+    expect(calls.length).toBeGreaterThan(2)
+    const summary = `${tmp.path}/wiki/sources/${sourceSummarySlugFromIdentity("project-a/short-dense.md")}.md`
+    expect(await realFs.fileExists(summary)).toBe(true)
+  })
+
+  it("bounds repeated chunk truncation and never writes a successful summary", async () => {
+    if (!tmp) throw new Error("missing temp project")
+    const sourcePath = `${tmp.path}/raw/sources/project-a/still-dense.md`
+    await writeFileRaw(sourcePath, "Dense configuration.\n".repeat(300))
+    truncateAnalysisOnce = true
+    truncateChunkCount = 100
+    await expect(autoIngest(tmp.path, sourcePath, useWikiStore.getState().llmConfig)).rejects.toThrow("minimum recovery size")
+    const calls = mockStreamChat.mock.calls.filter(c => String(c[1]?.[0]?.content).startsWith("You are analyzing a long source document"))
+    expect(calls.length).toBeLessThanOrEqual(4)
+    const summary = `${tmp.path}/wiki/sources/${sourceSummarySlugFromIdentity("project-a/still-dense.md")}.md`
+    expect(await realFs.fileExists(summary)).toBe(false)
   })
 
   it("moves the canonical source summary and its source reference", async () => {

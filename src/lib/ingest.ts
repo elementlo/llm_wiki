@@ -52,6 +52,9 @@ import { PROJECT_LOCAL_TERM_QUERY_RULES } from "@/lib/research-query-grounding"
 const LONG_SOURCE_MIN_BUDGET = 8_000
 const LONG_SOURCE_MAX_SINGLE_PASS_BUDGET = 300_000
 const LONG_SOURCE_CHUNK_MIN = 12_000
+// Output density can overflow on much shorter documents. Recovery may go
+// below the normal throughput-oriented chunk size, but never recurse forever.
+const ANALYSIS_RECOVERY_CHUNK_MIN = 1_000
 const LONG_SOURCE_CHUNK_MAX = 60_000
 const LONG_SOURCE_DIGEST_MAX = 15_000
 const LONG_SOURCE_CHUNK_ANALYSIS_MAX = 40_000
@@ -1126,7 +1129,7 @@ async function autoIngestImpl(
         sourceBudget,
         activityId,
         signal,
-        LONG_SOURCE_CHUNK_MIN,
+        Math.max(ANALYSIS_RECOVERY_CHUNK_MIN, Math.min(LONG_SOURCE_CHUNK_MIN, Math.floor(sourceContext.length / 2))),
       )
       if (fallbackPlan.chunked) {
         analysis = fallbackPlan.analysis
@@ -3161,9 +3164,9 @@ async function analyzeLongSourceInChunks(
   overrideTargetChars?: number,
 ): Promise<LongSourcePlan> {
   const targetChars = overrideTargetChars
-    ? clampNumber(overrideTargetChars, LONG_SOURCE_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX)
+    ? clampNumber(overrideTargetChars, ANALYSIS_RECOVERY_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX)
     : clampNumber(Math.floor(sourceBudget * 0.55), LONG_SOURCE_CHUNK_MIN, LONG_SOURCE_CHUNK_MAX)
-  const overlapChars = clampNumber(Math.floor(targetChars * 0.08), 800, 3_000)
+  const overlapChars = clampNumber(Math.floor(targetChars * 0.08), 80, 3_000)
   const chunks = splitSourceIntoSemanticChunks(sourceContent, targetChars, overlapChars)
   if (chunks.length <= 1) {
     return { chunked: false, analysis: "", sourceContext: sourceContent }
@@ -3233,11 +3236,18 @@ async function analyzeLongSourceInChunks(
     throwIfIngestAborted(signal, activityId)
     if (hadError) throw new Error("Chunk analysis stream failed")
     if (analysisTruncated) {
+      if (targetChars > ANALYSIS_RECOVERY_CHUNK_MIN) {
+        const smallerTarget = Math.max(ANALYSIS_RECOVERY_CHUNK_MIN, Math.floor(targetChars / 2))
+        activity.updateItem(activityId, { detail: "Chunk analysis output truncated; reducing recovery chunk size..." })
+        return analyzeLongSourceInChunks(projectPath, llmConfig, purpose, schema, index,
+          sourceIdentity, sourceSummarySlug, folderContext, sourceContent, sourceBudget,
+          activityId, signal, smallerTarget)
+      }
       const message =
         `Chunk ${chunk.index}/${chunk.total} analysis was truncated after reaching the ` +
-        `${analysisRequest.maxTokens.toLocaleString()} token output limit; the saved checkpoint will be retried`
+        `${analysisRequest.maxTokens.toLocaleString()} token output limit at the minimum recovery size`
       activity.updateItem(activityId, { status: "error", detail: message })
-      throw new Error(message)
+      throw new NonRetryableIngestError(message)
     }
 
     const chunkAnalysis = extractMarkedSection(raw, "Chunk Analysis") || raw.trim()
